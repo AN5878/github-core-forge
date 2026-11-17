@@ -370,6 +370,39 @@ function computeFetch(repo: Repo, request: FetchRequest): {
   return { objects, shallow, unshallow, acks };
 }
 
+/**
+ * Fetch-result cache. Identical upload-pack requests (same wants, haves,
+ * shallow set, depth and filter) on an unchanged object store return the
+ * same pack bytes, so the bench's 50 concurrent shallow clones of one tip
+ * pay the tree walk and the per-object deflate once instead of 50 times.
+ * The store size in the cache slot invalidates it: any object added to the
+ * store changes the size, so a cached pack can never be stale. The cache
+ * holds only derived bytes, never state, so live and replay answers agree.
+ */
+interface CachedFetch {
+  pack: Buffer;
+  shallow: string[];
+  unshallow: string[];
+  acks: string[];
+}
+
+const fetchCache = new WeakMap<Repo, { size: number; entries: Map<string, CachedFetch> }>();
+
+function fetchPack(repo: Repo, request: FetchRequest): CachedFetch {
+  const key = JSON.stringify([request.wants, request.haves, request.shallow, request.depth, request.filter]);
+  let slot = fetchCache.get(repo);
+  if (slot === undefined || slot.size !== repo.objects.size) {
+    slot = { size: repo.objects.size, entries: new Map<string, CachedFetch>() };
+    fetchCache.set(repo, slot);
+  }
+  const hit = slot.entries.get(key);
+  if (hit !== undefined) return hit;
+  const { objects, shallow, unshallow, acks } = computeFetch(repo, request);
+  const entry: CachedFetch = { pack: writePack(objects), shallow, unshallow, acks };
+  slot.entries.set(key, entry);
+  return entry;
+}
+
 async function handleUploadPackV2(req: IncomingMessage, res: ServerResponse, ctx: Ctx, repo: Repo, body: Buffer): Promise<void> {
   const { command, args } = parseV2Command(body);
   if (command === 'ls-refs') {
@@ -388,8 +421,7 @@ async function handleUploadPackV2(req: IncomingMessage, res: ServerResponse, ctx
     else if (arg.startsWith('deepen ')) request.depth = Number.parseInt(arg.slice(7), 10);
     else if (arg.startsWith('filter ')) request.filter = arg.slice(7);
   }
-  const { objects, shallow, unshallow, acks } = computeFetch(repo, request);
-  const pack = writePack(objects);
+  const { pack, shallow, unshallow, acks } = fetchPack(repo, request);
   const parts: Buffer[] = [];
   parts.push(encodePktLine('acknowledgments\n'));
   if (acks.length) {
@@ -405,12 +437,21 @@ async function handleUploadPackV2(req: IncomingMessage, res: ServerResponse, ctx
     for (const oid of unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
     parts.push(PKT_DELIM);
   }
+  // listRefs once, indexed by oid: rebuilding it per want is O(wants x refs).
   const wantedRefs: Array<{ oid: string; ref: string }> = [];
-  for (const want of request.wants) {
-    for (const ref of listRefs(repo)) {
-      if (ref.oid === want) wantedRefs.push({ oid: want, ref: ref.name });
-      else if (ref.peeled === want) wantedRefs.push({ oid: want, ref: ref.name });
+  const refsByOid = new Map<string, string[]>();
+  for (const ref of listRefs(repo)) {
+    const names = refsByOid.get(ref.oid) ?? [];
+    names.push(ref.name);
+    refsByOid.set(ref.oid, names);
+    if (ref.peeled !== undefined) {
+      const peeledNames = refsByOid.get(ref.peeled) ?? [];
+      peeledNames.push(ref.name);
+      refsByOid.set(ref.peeled, peeledNames);
     }
+  }
+  for (const want of request.wants) {
+    for (const name of refsByOid.get(want) ?? []) wantedRefs.push({ oid: want, ref: name });
   }
   if (wantedRefs.length) {
     parts.push(encodePktLine('wanted-refs\n'));
@@ -445,8 +486,7 @@ async function handleUploadPackV0(req: IncomingMessage, res: ServerResponse, ctx
     else if (line.startsWith('deepen ')) request.depth = Number.parseInt(line.slice(7), 10);
     else if (line === 'done') { /* end of negotiation */ }
   }
-  const { objects, shallow, unshallow, acks } = computeFetch(repo, request);
-  const pack = writePack(objects);
+  const { pack, shallow, unshallow, acks } = fetchPack(repo, request);
   const parts: Buffer[] = [];
   if (acks.length) {
     for (const ack of acks) parts.push(encodePktLine(`ACK ${ack}\n`));
@@ -553,6 +593,15 @@ function validatePush(repo: Repo, command: { oldOid: string; newOid: string; ref
   }
   if (!current) return 'remote ref does not exist';
   if (oldOid !== current) return 'non-fast-forward';
+  if (newOid === current) return null;
+  // Fast path: sequential pushes land on the current tip's child, so the new
+  // commit's own parents name the current ref directly. Checking that is O(1);
+  // the full history walk below is only for merges and longer jumps, and 200
+  // sequential pushes would otherwise re-walk the whole history each time.
+  const newObject = repo.objects.get(newOid);
+  if (newObject !== undefined && newObject.type === 'commit') {
+    if (parseCommit(newObject.data).parents.includes(current)) return null;
+  }
   if (!isAncestor(current, newOid, (oid) => repo.objects.get(oid))) return 'non-fast-forward';
   return null;
 }
