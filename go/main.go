@@ -12,10 +12,14 @@ import (
 	"sync"
 )
 
-// mu serializes dispatch: the store is single-threaded by design (like the
-// Node original), so no handler ever races another. Body reads and socket
-// writes happen outside the lock, one goroutine per connection.
-var mu sync.Mutex
+// mu guards the store. Reads run concurrently under RLock; writes take the
+// exclusive Lock. Every read path is a pure read of the store: no read
+// handler advances the deterministic clock, mutates a repo, or writes a
+// shared map — the only shared mutable structure a read touches is the fetch
+// cache, which is a sync.Map (see githttp.go), and the request-id counter,
+// which is atomic. Body reads and socket writes happen outside the lock, one
+// goroutine per connection.
+var mu sync.RWMutex
 
 func main() {
 	ln, err := net.Listen("tcp", ":0")
@@ -34,9 +38,28 @@ func main() {
 }
 
 func route(ctx *Ctx, req *Request) Response {
+	if isReadOnly(req) {
+		mu.RLock()
+		defer mu.RUnlock()
+		return dispatch(ctx, req)
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	return dispatch(ctx, req)
+}
+
+// isReadOnly reports whether a request can only read the store. GET/HEAD
+// never mutate, and git upload-pack (ls-refs / fetch) is a pure read; every
+// other method (REST creates/updates/deletes, GraphQL, MCP, receive-pack)
+// can mutate and takes the exclusive lock.
+func isReadOnly(req *Request) bool {
+	if req.Method == "GET" || req.Method == "HEAD" {
+		return true
+	}
+	if req.Method == "POST" && strings.Contains(req.Path, ".git/git-upload-pack") {
+		return true
+	}
+	return false
 }
 
 func dispatch(ctx *Ctx, req *Request) Response {

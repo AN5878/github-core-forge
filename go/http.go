@@ -16,13 +16,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // Ctx is the per-process request context.
 type Ctx struct {
 	Forge  *Forge
 	Token  string
-	ReqSeq int
+	ReqSeq atomic.Int64 // request ids must stay unique under concurrent reads
 }
 
 // Request is one parsed HTTP request.
@@ -138,10 +139,12 @@ func asBool(v interface{}) bool {
 
 // ---------------------------------------------------------------- plumbing
 
-// nextRequestID returns a deterministic counter-based request id.
+// nextRequestID returns a deterministic counter-based request id. The
+// counter is atomic so concurrent read handlers can mint ids without a lock;
+// ids are unique per process, and their assignment order is not part of the
+// exported state.
 func nextRequestID(ctx *Ctx) string {
-	ctx.ReqSeq++
-	return "req-" + itoa(ctx.ReqSeq)
+	return "req-" + itoa(int(ctx.ReqSeq.Add(1)))
 }
 
 // checkAuth is true when the request carries the trial's bearer <redacted>

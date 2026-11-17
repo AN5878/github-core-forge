@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 )
 
 const agent = "forge/1.0"
@@ -496,40 +497,62 @@ type cachedFetch struct {
 	shallow   []string
 	unshallow []string
 	acks      []string
-	v2Resp    []byte
-	v0Resp    []byte
 }
+
+// A cachedFetch is immutable once built: the pack and the shallow/ack lists
+// are derived from the object store at one size, and never mutated, so any
+// number of concurrent readers can share one entry. (The v2/v0 response
+// framing is rebuilt per request from the entry — cheap, and it keeps the
+// entry race-free.)
 
 type fetchSlot struct {
 	size    int
-	entries map[string]*cachedFetch
+	entries sync.Map // fetch key -> *cachedFetch
 }
 
-var fetchCache = map[*Repo]*fetchSlot{}
+// fetchCache maps a repo to its fetch slot. A sync.Map so concurrent read
+// handlers can look up (and install) slots without a global lock. A slot is
+// valid only while its size matches the repo's object count; a writer can
+// only add objects, so a size mismatch means the slot is stale and is
+// replaced (Store overwrites). The size cannot change while a read lock is
+// held, so a slot built inside fetchPack stays valid for that call.
+var fetchCache sync.Map // *Repo -> *fetchSlot
 
 func fetchCacheKey(request FetchRequest) string {
 	raw, _ := json.Marshal([]interface{}{request.Wants, request.Haves, request.Shallow, request.Depth, request.Filter})
 	return string(raw)
 }
 
+func buildFetchEntry(repo *Repo, request FetchRequest) *cachedFetch {
+	objects, shallow, unshallow, acks := computeFetch(repo, request)
+	return &cachedFetch{pack: writePack(objects), shallow: shallow, unshallow: unshallow, acks: acks}
+}
+
 // fetchPack returns the cached fetch computation for an identical upload-pack
-// request on an unchanged object store. The store size in the slot invalidates
-// it: any object added to the store changes the size, so a cached pack can
-// never be stale. The cache holds only derived bytes, never state, so live
-// and replay answers agree.
+// request on an unchanged object store. The store size in the slot
+// invalidates it: any object added to the store changes the size, so a cached
+// pack can never be stale. The cache holds only derived bytes, never state,
+// so live and replay answers agree. Concurrent readers may compute the same
+// entry twice (LoadOrStore keeps one); the bytes are deterministic, so the
+// duplicate is harmless.
 func fetchPack(repo *Repo, request FetchRequest) *cachedFetch {
 	key := fetchCacheKey(request)
-	slot, ok := fetchCache[repo]
-	if !ok || slot.size != len(repo.Objects) {
-		slot = &fetchSlot{size: len(repo.Objects), entries: map[string]*cachedFetch{}}
-		fetchCache[repo] = slot
+	size := len(repo.Objects)
+	if v, ok := fetchCache.Load(repo); ok {
+		slot := v.(*fetchSlot)
+		if slot.size == size {
+			if hit, ok := slot.entries.Load(key); ok {
+				return hit.(*cachedFetch)
+			}
+			entry := buildFetchEntry(repo, request)
+			actual, _ := slot.entries.LoadOrStore(key, entry)
+			return actual.(*cachedFetch)
+		}
 	}
-	if hit, ok := slot.entries[key]; ok {
-		return hit
-	}
-	objects, shallow, unshallow, acks := computeFetch(repo, request)
-	entry := &cachedFetch{pack: writePack(objects), shallow: shallow, unshallow: unshallow, acks: acks}
-	slot.entries[key] = entry
+	slot := &fetchSlot{size: size}
+	entry := buildFetchEntry(repo, request)
+	slot.entries.Store(key, entry)
+	fetchCache.Store(repo, slot)
 	return entry
 }
 
@@ -570,9 +593,6 @@ func handleUploadPackV2(req *Request, ctx *Ctx, repo *Repo) Response {
 		}
 	}
 	entry := fetchPack(repo, request)
-	if entry.v2Resp != nil {
-		return sendGit(200, entry.v2Resp, "application/x-git-upload-pack-result")
-	}
 	var buf bytes.Buffer
 	buf.Write(encodePktLine([]byte("acknowledgments\n")))
 	if len(entry.acks) > 0 {
@@ -624,9 +644,7 @@ func handleUploadPackV2(req *Request, ctx *Ctx, repo *Repo) Response {
 		buf.Write(packet)
 	}
 	buf.Write(pktFlush)
-	resp := buf.Bytes()
-	entry.v2Resp = resp
-	return sendGit(200, resp, "application/x-git-upload-pack-result")
+	return sendGit(200, buf.Bytes(), "application/x-git-upload-pack-result")
 }
 
 // ------------------------------------------------------------------ upload-pack v0
@@ -669,9 +687,6 @@ func handleUploadPackV0(req *Request, ctx *Ctx, repo *Repo) Response {
 		}
 	}
 	entry := fetchPack(repo, request)
-	if entry.v0Resp != nil {
-		return sendGit(200, entry.v0Resp, "application/x-git-upload-pack-result")
-	}
 	var buf bytes.Buffer
 	if len(entry.acks) > 0 {
 		for _, ack := range entry.acks {
@@ -690,9 +705,7 @@ func handleUploadPackV0(req *Request, ctx *Ctx, repo *Repo) Response {
 		buf.Write(packet)
 	}
 	buf.Write(pktFlush)
-	resp := buf.Bytes()
-	entry.v0Resp = resp
-	return sendGit(200, resp, "application/x-git-upload-pack-result")
+	return sendGit(200, buf.Bytes(), "application/x-git-upload-pack-result")
 }
 
 // ------------------------------------------------------------------ receive-pack (v0)

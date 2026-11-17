@@ -7,12 +7,22 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// issueCreateInput is the create-issue body ({title, body, labels}): a struct
+// decode is much cheaper than the interface{} decode, and the write workload
+// posts exactly this shape.
+type issueCreateInput struct {
+	Title  string   `json:"title"`
+	Body   string   `json:"body"`
+	Labels []string `json:"labels"`
+}
 
 func restErr(ctx *Ctx, status int, message string) Response {
 	return jsonResponse(status, map[string]interface{}{"message": message}, [][2]string{{"X-GitHub-Request-Id", nextRequestID(ctx)}})
@@ -220,19 +230,39 @@ func handleRest(req *Request, ctx *Ctx) Response {
 
 	// Body: GET/HEAD read none; DELETE reads its body when present; the rest
 	// parse and answer 400 on malformed JSON.
-	var body interface{} = map[string]interface{}{}
-	if method != "GET" && method != "HEAD" {
-		if len(req.Body) > 0 || method != "DELETE" {
-			parsed, ok := parseJSONBody(req.Body)
-			if !ok {
-				return restErr(ctx, 400, "Problems parsing JSON")
+	var input map[string]interface{}
+	if method == "POST" && len(rest) == 4 && rest[0] == "repos" && rest[3] == "issues" {
+		// Fast path: issue create carries only {title, body, labels}; a
+		// struct decode is much cheaper than the interface{} decode. Any
+		// mismatch (wrong types, malformed JSON, trailing data) falls through
+		// to the generic parse below, preserving the exact old behaviour.
+		var s issueCreateInput
+		if len(req.Body) > 0 && json.Unmarshal(req.Body, &s) == nil {
+			input = map[string]interface{}{"title": s.Title, "body": s.Body}
+			if len(s.Labels) > 0 {
+				arr := make([]interface{}, len(s.Labels))
+				for i, l := range s.Labels {
+					arr[i] = l
+				}
+				input["labels"] = arr
 			}
-			body = parsed
 		}
 	}
-	input, _ := isRecord(body)
 	if input == nil {
-		input = map[string]interface{}{}
+		var body interface{} = map[string]interface{}{}
+		if method != "GET" && method != "HEAD" {
+			if len(req.Body) > 0 || method != "DELETE" {
+				parsed, ok := parseJSONBody(req.Body)
+				if !ok {
+					return restErr(ctx, 400, "Problems parsing JSON")
+				}
+				body = parsed
+			}
+		}
+		input, _ = isRecord(body)
+		if input == nil {
+			input = map[string]interface{}{}
+		}
 	}
 
 	// ---------------------------------------------------------- /api/v3/ root
@@ -626,7 +656,7 @@ func handleRepoTail(req *Request, ctx *Ctx, repo *Repo, tail []string, input map
 				if errMsg != "" {
 					return restErr(ctx, 422, errMsg)
 				}
-				return restOK(ctx, 201, issueJSON(created), nil)
+				return restOKBytes(ctx, 201, issueJSONBytes(created), nil)
 			}
 			if method == "GET" {
 				state := q.Get("state")
@@ -666,7 +696,7 @@ func handleRepoTail(req *Request, ctx *Ctx, repo *Repo, tail []string, input map
 				return restErr(ctx, 404, "Not Found")
 			}
 			if method == "GET" {
-				return restOK(ctx, 200, issueJSON(issue), nil)
+				return restOKBytes(ctx, 200, issueJSONBytes(issue), nil)
 			}
 			if method == "PATCH" {
 				if state, ok := input["state"].(string); ok && (state == "open" || state == "closed") {
@@ -680,7 +710,7 @@ func handleRepoTail(req *Request, ctx *Ctx, repo *Repo, tail []string, input map
 				if body, ok := input["body"].(string); ok {
 					issue.Body = body
 				}
-				return restOK(ctx, 200, issueJSON(issue), nil)
+				return restOKBytes(ctx, 200, issueJSONBytes(issue), nil)
 			}
 			return restErr(ctx, 404, "Not Found")
 		}
